@@ -1,10 +1,7 @@
 package com.meizu.algo.info
 
-import java.io._
-
-import com.meizu.algo.classify.FastTextClassifier
+import com.meizu.algo.classify.{ClassifyDataFrame, FastTextClassifier}
 import com.meizu.algo.util._
-import org.apache.spark.SparkFiles
 import org.apache.spark.sql.{DataFrame, Row}
 
 /**
@@ -27,13 +24,18 @@ object InfoFastText {
     val op: String = args(0)
     isDebug = args(1).toLowerCase == "true"
     val statDate = args(2)
-    val cat = args(3)
     op match {
       case "userpv" => queryUserPV(statDate)
       case "uc" => queryUcArticle(statDate)
       case "seg" => queryAndSegData(statDate)
-      case "pcat" => catParent(statDate, cat)
-      case "ccat" => catChild(statDate, cat)
+      case "pcat" => {
+        val cat = args(3)
+        catParent(statDate, cat)
+      }
+      case "ccat" =>{
+        val cat = args(3)
+        catChild(statDate, cat)
+      }
       case "union" => unionAllCatArticle(statDate)
       case "stat" => statCatCount(statDate)
       case _ => {
@@ -90,7 +92,7 @@ object InfoFastText {
   def queryUserPV(statDate: String) = {
     val sparkEnv = new SparkEnv("queryUserPV").sparkEnv
     val ori_sql =
-      s"""select imei,cast(article_id as bigint) as fid ,sum(read_cnt) as sumcnt from mzreader.adl_fdt_read_indiv_stream_detail
+      s"""select imei,cast(article_id as bigint) as fid ,sum(read_cnt) as sumcnt from mzreader.dwd_app_stream_detail_reader
          |where stat_date=${statDate}
          |and imei is not null
          |and article_id is not null
@@ -117,10 +119,17 @@ object InfoFastText {
 
   def unionAllCatArticle(statDate: String) = {
     val sparkEnv = new SparkEnv("unionAllCat").sparkEnv
+    // 由于有的类别只有一级分类，不带二级分类, 需要从parentCatTable中将这些类别取出来.
+    val onlyParentCat = Array("摄影","宠物","彩票","美文","干货","美食","幽默").map(r=>{
+      "'" + r + "'"
+    }).mkString(",")
     val ori_sql =
       s"""select fid,fcategory from ${ucTable} where stat_date=${statDate}
          | union all
          | select fid,cat from ${childCatTable} where stat_date=${statDate}
+         | union all
+         | select fid,cat from ${parentCatTable} where stat_date=${statDate}
+         | and cat in (${onlyParentCat})
       """.stripMargin
     val data = sparkEnv.sql(ori_sql).toDF("fid", "cat")
     DXPUtils.saveDataFrame(data, unionAllCatTable, statDate, sparkEnv)
@@ -131,10 +140,19 @@ object InfoFastText {
    */
   def queryAndSegData(statDate: String) = {
     val sparkEnv = new SparkEnv("seg_data").sparkEnv
+    /*
     val ori_sql =
       s"""select a.fid,a.ftitle,decode(unbase64(a.fcontent),'utf-8')  from mzreader.ods_t_article_c a
          | join (select distinct(fid) from ${userPvTable} where stat_date=${statDate} and fid is not null) b
          | on a.fid = b.fid where (a.fcontent is not null or a.ftitle is not null) and
+         | (a.fcategory is null or length(trim(a.fcategory)) <= 1)
+      """.stripMargin
+      */
+
+    val ori_sql =
+      s"""select a.fid,a.ftitle,decode(unbase64(a.fcontent),'utf-8')  from mzreader.ods_t_article_c a
+         | join (select distinct(fid) from ${userPvTable} where stat_date=${statDate} and fid is not null) b
+         | on a.fid = b.fid where (a.fcontent is not null and a.fcontent != "") and
          | (a.fcategory is null or length(trim(a.fcategory)) <= 1)
       """.stripMargin
 
@@ -173,30 +191,14 @@ object InfoFastText {
     val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
 
 
-    val catData = sparkEnv.sql(sql).rdd.mapPartitions(e => {
-      val (key, parentModel) = loadSingleModel(cat)
-      e.map(r => {
-        val pcat = {
-          try {
-            parentModel.predictWithProb(r.getAs[String](1))
-          } catch {
-            case ex: Throwable => {
-              Log.info("error :" + ex.getMessage)
-              Log.info(s"** ${r.getAs[Long](0)}")
-              ("unknow", -1.0)
-            }
-          }
-        }
-        (r.getAs[Long](0), r.getAs[String](1), pcat._1, pcat._2)
-      })
-    })
+    val catData = ClassifyDataFrame.classifyData(sparkEnv.sql(sql),cat)
 
     val cols = Array("fid", "words", "cat", "prob")
     val colsType = Array("long", "string", "string", "double")
     val st = DXPUtils.createSchema(cols.zip(colsType))
     val df: DataFrame = sparkEnv.createDataFrame(catData.map(r => {
       Row(r._1, r._2, r._3, r._4)
-    }), st)
+    }), st).repartition(200)
     DXPUtils.saveDataFrame(df, parentCatTable, statDate, sparkEnv)
   }
 
@@ -205,23 +207,7 @@ object InfoFastText {
     val ori_sql = s"select fid,words from ${parentCatTable} where stat_date=${statDate} and cat='${cat}'"
     val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
 
-    val catData = sparkEnv.sql(sql).rdd.mapPartitions(e => {
-      val (key, childModel) = loadSingleModel(cat)
-      e.map(r => {
-        val pcat = {
-          try {
-            childModel.predictWithProb(r.getAs[String](1))
-          } catch {
-            case ex: Throwable => {
-              Log.info("error :" + ex.getMessage)
-              Log.info(s"** ${r.getAs[Long](0)}")
-              ("unknow", -1.0)
-            }
-          }
-        }
-        (r.getAs[Long](0), r.getAs[String](1), pcat._1, pcat._2)
-      })
-    })
+    val catData = ClassifyDataFrame.classifyData(sparkEnv.sql(sql),cat)
 
     val cols = Array("fid", "words", "cat", "prob")
     val colsType = Array("long", "string", "string", "double")
@@ -259,27 +245,6 @@ object InfoFastText {
       Row(r._1, r._2.mkString(" "))
     }), st)
     DXPUtils.saveDataFrame(df, segTable, statDate, sparkEnv)
-  }
-
-
-  private def loadModel(modelDir: File) = {
-    val models = modelDir.listFiles(new FilenameFilter {
-      override def accept(dir: File, name: String): Boolean = name.endsWith("mode.bin") || name.endsWith("mode.ftz")
-    }).map(f => {
-      val key = f.getName.substring(0, f.getName.indexOf("."))
-      val m = new FastTextClassifier(f.getAbsolutePath, key)
-      (key, m)
-    }).toMap
-
-    Log.info("finish load model =" + models.keySet.mkString(","))
-    models
-  }
-
-  def loadSingleModel(cat: String) = {
-    val catFile = s"${cat}.mode.ftz"
-    val tmpFile = SparkFiles.get(catFile)
-    val m = new FastTextClassifier(tmpFile, cat)
-    (cat, m)
   }
 
 }

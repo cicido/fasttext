@@ -14,7 +14,8 @@ class FastTextClassifier(val modelFile: String, parent: String) {
 
   def predict(text: String): String = {
     if (text == null || text.trim.length == 0) return "unknow"
-    val txt = Segment.segment3(text).mkString(" ")
+    //val txt = Segment.segment3(text).mkString(" ")
+    val txt = text
     if (txt.isEmpty) return "unknow"
     val result = model.predict(txt)
     if (result != null) result.replace("__label__", "") else if (!isSub) "unknow" else parent + "_other"
@@ -26,16 +27,17 @@ class FastTextClassifier(val modelFile: String, parent: String) {
    */
   def predictWithProb(text:String):(String,Double) = {
     if (text == null || text.trim.length == 0) return ("unknow",-1.0)
-    val txt = Segment.segment3(text).mkString(" ")
-    if (txt.isEmpty) return ("unknow", -1.0)
+    //val txt = Segment.segment3(text).mkString(" ")
+    val txt = text
+    if (txt.isEmpty) return ("unknow", -2.0)
     val result = model.predictProba(txt)
     if (result != null) {
       val label = result.label.replace("__label__", "")
       val logprob = math.exp(result.logProb.toDouble)
       (label,logprob)
     } else if (!isSub)
-      ("unknow",-1.0)
-    else (parent + "_other",-1.0)
+      ("unknow",-3.0)
+    else (parent + "_other",-4.0)
   }
 
   def destroy(): Unit = {

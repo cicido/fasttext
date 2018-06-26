@@ -1,7 +1,8 @@
 package com.meizu.algo.info
 
-import com.meizu.algo.classify.{ClassifyDataFrame, FastTextClassifier}
+import com.meizu.algo.classify.ClassifyDataFrame
 import com.meizu.algo.util._
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row}
 
 /**
@@ -10,14 +11,24 @@ import org.apache.spark.sql.{DataFrame, Row}
 object InfoFastText {
 
   val userPvTable = "algo.dxp_info_user_pv_day"
-  val segTable = "algo.dxp_info_nouc_seg_day"
   val ucTable = "algo.dxp_info_uc_fid_cat_day"
-  val parentCatTable = "algo.dxp_info_nouc_pcat_day"
-  val childCatTable = "algo.dxp_info_nouc_ccat_day"
-  val unionAllCatTable = "algo.dxp_info_all_cat_day"
-  //val imeiCatTable = "algo.dxp_info_imei_cat_cnt_day"
+
+  val titleSegTable = "algo.dxp_info_nouc_title_seg_day"
+  val contentSegTable = "algo.dxp_info_nouc_content_seg_day"
+
+  val titlePcatTable = "algo.dxp_info_nouc_title_pcat_day"
+  val contentPcatTable = "alog.dxp_info_nouc_content_pcat_day"
+  val titleCcatTable = "algo.dxp_info_nouc_title_ccat_day"
+  val contentCcatTable = "algo.dxp_info_nouc_content_ccat_day"
+
+  val unionAllCatTable = "algo.dxp_info_fid_cat_day"
+
   val imeiCatTable = "algo.dxp_info_imei_pcat_ccat_cnt_day"
   var isDebug = false
+
+  val subCats = Array("两性情感","体育","健康","军事","历史","国际",
+    "娱乐","房产","教育","旅游","时尚","星座",
+    "汽车","游戏","社会","科学探索","科技","育儿","财经")
 
   // 一份代码中完成3个功能，根据参数来指定分类还是取关键词
   def main(args: Array[String]): Unit = {
@@ -27,16 +38,19 @@ object InfoFastText {
     op match {
       case "userpv" => queryUserPV(statDate)
       case "uc" => queryUcArticle(statDate)
-      case "seg" => queryAndSegData(statDate)
-      case "pcat" => {
-        val cat = args(3)
-        catParent(statDate, cat)
+      case "seg" => queryAndSegData(statDate,titleSegTable, contentSegTable)
+      case "title" => {
+        catParent(statDate,titleSegTable, titlePcatTable)
+        catChild(statDate,titlePcatTable,titleCcatTable)
       }
-      case "ccat" =>{
-        val cat = args(3)
-        catChild(statDate, cat)
+      case "content" =>{
+        catParent(statDate,contentSegTable, contentPcatTable)
+        catChild(statDate,contentPcatTable, contentCcatTable)
       }
-      case "union" => unionAllCatArticle(statDate)
+      case "union" => {
+        val uType = args(3).toInt
+        unionAllCatArticle(statDate,uType)
+      }
       case "stat" => statCatCount(statDate)
       case _ => {
         println(
@@ -117,43 +131,72 @@ object InfoFastText {
     DXPUtils.saveDataFrame(data, ucTable, statDate, sparkEnv)
   }
 
-  def unionAllCatArticle(statDate: String) = {
+  def unionAllCatArticle(statDate: String, uType:Int) = {
     val sparkEnv = new SparkEnv("unionAllCat").sparkEnv
     // 由于有的类别只有一级分类，不带二级分类, 需要从parentCatTable中将这些类别取出来.
     val onlyParentCat = Array("摄影","宠物","彩票","美文","干货","美食","幽默").map(r=>{
       "'" + r + "'"
     }).mkString(",")
-    val ori_sql =
-      s"""select fid,fcategory from ${ucTable} where stat_date=${statDate}
+    /*
+    utype=1, 表示只取uc类别数据
+    utype=2, 表示取uc类别数据与非uc中文章不为空的数据
+    utype=其他，表示合并uc类别数据及非uc中标题或内容算出来的类别
+     */
+    val ucSql = "select fid,fcategory from ${ucTable} where stat_date=${statDate}"
+    val noUcSql =
+      s"""select fid,cat,prob from ${titlePcatTable} where stat_date=${statDate}
          | union all
-         | select fid,cat from ${childCatTable} where stat_date=${statDate}
+         | select fid,cat,prob from ${titleCcatTable} where stat_date=${statDate}
          | union all
-         | select fid,cat from ${parentCatTable} where stat_date=${statDate}
-         | and cat in (${onlyParentCat})
+         | select fid,cat,prob from ${contentPcatTable} where stat_date=${statDate}
+         | union all
+         | select fid,cat,prob from ${contentCcatTable} where stat_date=${statDate}
       """.stripMargin
-    val data = sparkEnv.sql(ori_sql).toDF("fid", "cat")
-    DXPUtils.saveDataFrame(data, unionAllCatTable, statDate, sparkEnv)
+    if(uType == 1){
+      val data = sparkEnv.sql(ucSql).toDF("fid", "cat")
+      DXPUtils.saveDataFrame(data, unionAllCatTable, statDate, sparkEnv)
+    }else{
+      /*
+      分情况统计：
+      1. 父类是unknow,去掉
+      2. 根据union后的catArray长度分析，在判断之前，先按cat长度从小到大排序.
+      i. 是否存在包含关系.
+      ii. 如果不存在包含关系,则按概率进行选择.
+       */
+      val ucData:RDD[(Long,String)] = sparkEnv.sql(ucSql).rdd.map(r=>(r.getAs[Long](0),r.getAs[String](1)))
+
+      def selectCat(x:(String,Double),y:(String,Double)): (String,Double) = {
+        if(y._1.contains(x._1) || y._2 >= x._2 ) y else x
+      }
+
+      val noUcData = sparkEnv.sql(noUcSql).rdd.map(r=>{
+        (r.getAs[Long](0),r.getAs[String](1),r.getAs[Double](2))
+      }).filter(_._2 != "unknow").map(r=>(r._1,Array((r._2,r._3)))).reduceByKey(_ ++ _).map(r=>{
+        val fid = r._1
+        val (cat,prob) = r._2.sortWith(_._1.length < _._1.length).reduceLeft(selectCat)  // 按字符串长度排序.
+        (fid,cat)
+      })
+      val cols = Array("fid", "cat")
+      val colsType = Array("long", "string")
+      val st = DXPUtils.createSchema(cols.zip(colsType))
+      val df: DataFrame = sparkEnv.createDataFrame(ucData.union(noUcData).map(r => {
+        Row(r._1, r._2)
+      }), st).repartition(200)
+      DXPUtils.saveDataFrame(df, unionAllCatTable, statDate, sparkEnv)
+    }
   }
 
   /*
   对每天用户浏览的非uc文章进行分词
    */
-  def queryAndSegData(statDate: String) = {
+  def queryAndSegData(statDate: String, titleSegTable:String, contentSegTable:String) = {
     val sparkEnv = new SparkEnv("seg_data").sparkEnv
-    /*
-    val ori_sql =
-      s"""select a.fid,a.ftitle,decode(unbase64(a.fcontent),'utf-8')  from mzreader.ods_t_article_c a
-         | join (select distinct(fid) from ${userPvTable} where stat_date=${statDate} and fid is not null) b
-         | on a.fid = b.fid where (a.fcontent is not null or a.ftitle is not null) and
-         | (a.fcategory is null or length(trim(a.fcategory)) <= 1)
-      """.stripMargin
-      */
 
     val ori_sql =
-      s"""select a.fid,a.ftitle,decode(unbase64(a.fcontent),'utf-8')  from mzreader.ods_t_article_c a
-         | join (select distinct(fid) from ${userPvTable} where stat_date=${statDate} and fid is not null) b
-         | on a.fid = b.fid where (a.fcontent is not null and a.fcontent != "") and
-         | (a.fcategory is null or length(trim(a.fcategory)) <= 1)
+      s"""select a.fid,a.ftitle,decode(unbase64(a.fcontent),'utf-8')  from (select distinct(fid) as fid from ${userPvTable}
+         | where stat_date=${statDate} and fid is not null) b
+         | join mzreader.ods_t_article_c a
+         | on a.fid = b.fid where a.fcategory is null or length(trim(a.fcategory)) <= 1
       """.stripMargin
 
     val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
@@ -162,34 +205,47 @@ object InfoFastText {
         val fid = r.getLong(0)
         val ftitle = r.getAs[String](1)
         val fcontent = r.getAs[String](2)
+        val titleStr = if (ftitle == null){
+          ""
+        } else {
+          ftitle.trim.replaceAll("\n"," ").replaceAll("<.*?>", " ")
+        }
+        val title = Segment.segment2(titleStr)
 
         val contentStr = if (fcontent == null) {
-          ftitle
+          ""
         } else {
-          fcontent.trim.replaceAll("\n", "").replaceAll("<.*?>", "")
+          fcontent.trim.replaceAll("\n", " ").replaceAll("<.*?>", " ")
         }
         val content = Segment.segment2(contentStr)
-        (fid, content)
+        (fid, title, content)
       })
     })
+    data.cache()
+
     val cols = Array("fid", "words")
     val colsType = Array("long", "string")
     val st = DXPUtils.createSchema(cols.zip(colsType))
-    val df: DataFrame = sparkEnv.createDataFrame(data.map(r => {
+    val titleDF: DataFrame = sparkEnv.createDataFrame(data.map(r => {
       Row(r._1, r._2.mkString(" "))
     }), st)
-    DXPUtils.saveDataFrame(df, segTable, statDate, sparkEnv)
+    DXPUtils.saveDataFrame(titleDF, titleSegTable, statDate, sparkEnv)
+
+    val contentDF: DataFrame = sparkEnv.createDataFrame(data.map(r => {
+      Row(r._1, r._3.mkString(" "))
+    }), st)
+    DXPUtils.saveDataFrame(contentDF, titleSegTable, statDate, sparkEnv)
   }
 
 
   /*
   根据cat查询数据，结果存在分区表，分区有两个字段stat_date, cat
    */
-  def catParent(statDate: String, cat: String) = {
+  def catParent(statDate: String, inputTable:String, outputTable:String) = {
+    val cat = "all"
     val sparkEnv = new SparkEnv(s"cat ${cat}").sparkEnv
-    val ori_sql = s"select fid,words from ${segTable} where stat_date=${statDate} "
+    val ori_sql = s"select fid,words from ${inputTable} where stat_date=${statDate} "
     val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
-
 
     val catData = ClassifyDataFrame.classifyData(sparkEnv.sql(sql),cat)
 
@@ -199,9 +255,47 @@ object InfoFastText {
     val df: DataFrame = sparkEnv.createDataFrame(catData.map(r => {
       Row(r._1, r._2, r._3, r._4)
     }), st).repartition(200)
-    DXPUtils.saveDataFrame(df, parentCatTable, statDate, sparkEnv)
+    DXPUtils.saveDataFrame(df, outputTable, statDate, sparkEnv)
   }
 
+  def catChild(statDate: String, inputTable:String, outputTable:String) = {
+    val sparkEnv = new SparkEnv(s"cat child").sparkEnv
+
+    val cat = subCats(0)
+    val ori_sql = s"select fid,words from ${inputTable} where stat_date=${statDate} and cat='${cat}'"
+    val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
+    var catData:RDD[(Long,String,String,Double)] = ClassifyDataFrame.classifyData(sparkEnv.sql(sql),cat)
+
+    for(cat <- subCats.slice(1,subCats.length)){
+      val ori_sql = s"select fid,words from ${inputTable} where stat_date=${statDate} and cat='${cat}'"
+      val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
+      catData = catData.union(ClassifyDataFrame.classifyData(sparkEnv.sql(sql),cat))
+    }
+
+    /*
+    val rddArray:Array[RDD[(Long,String,String,Double)]] = subCats.map(cat=>{
+      val ori_sql = s"select fid,words from ${parentCatTable} where stat_date=${statDate} and cat='${cat}'"
+      val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
+      ClassifyDataFrame.classifyData(sparkEnv.sql(sql),cat)
+    })
+
+    val myunion = (x:RDD[(Long,String,String,Double)], y:RDD[(Long,String,String,Double)]) => { x.union(y)}
+
+    val catData = rddArray.reduce(myunion)
+    */
+
+
+    val cols = Array("fid", "words", "cat", "prob")
+    val colsType = Array("long", "string", "string", "double")
+    val st = DXPUtils.createSchema(cols.zip(colsType))
+    val df: DataFrame = sparkEnv.createDataFrame(catData.map(r => {
+      Row(r._1, r._2, r._3, r._4)
+    }), st).repartition(200)
+
+    DXPUtils.saveDataFrame(df, outputTable, statDate, sparkEnv)
+  }
+
+  /*
   def catChild(statDate: String, cat: String) = {
     val sparkEnv = new SparkEnv(s"cat ${cat}").sparkEnv
     val ori_sql = s"select fid,words from ${parentCatTable} where stat_date=${statDate} and cat='${cat}'"
@@ -219,33 +313,8 @@ object InfoFastText {
     val catPinYin = StrUtil.getPinyinString(cat)
     DXPUtils.saveDataFrameWithTwoPartition(df, childCatTable, statDate, catPinYin, sparkEnv)
   }
-
-
-  /*
- 对所有非uc文章进行分词
   */
 
-  def queryAndSegAllData(statDate: String) = {
-    val sparkEnv = new SparkEnv("seg_data").sparkEnv
-    val ori_sql = "select fid,decode(unbase64(fcontent),'utf-8')  from mzreader.ods_t_article_c " +
-      " where fid is not null and fcontent is not null and (fcategory is null or length(trim(fcategory)) < 1)"
-    val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
-    val data = sparkEnv.sql(sql).rdd.repartition(1000).mapPartitions(it => {
-      it.map(r => {
-        val fid = r.getLong(0)
-        val contentStr = r.getString(1).trim.replaceAll("\n", "").replaceAll("<.*?>", "")
-        val content = Segment.segment2(contentStr)
-        (fid, content)
-      })
-    }).filter(_._2.length > 10)
-    val cols = Array("fid", "words")
-    val colsType = Array("long", "string")
-    val st = DXPUtils.createSchema(cols.zip(colsType))
-    val df: DataFrame = sparkEnv.createDataFrame(data.map(r => {
-      Row(r._1, r._2.mkString(" "))
-    }), st)
-    DXPUtils.saveDataFrame(df, segTable, statDate, sparkEnv)
-  }
 
 }
 

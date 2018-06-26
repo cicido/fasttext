@@ -1,16 +1,22 @@
 package com.meizu.algo.url
 
-import com.meizu.algo.classify.FastTextClassifier
+import com.meizu.algo.classify.{ClassifyDataFrame, FastTextClassifier}
 import com.meizu.algo.util._
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.SparkFiles
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 
 import scala.collection.mutable.ArrayBuffer
 
 /**
   * Created by dxp 2018-05-04
+  * 对通过url爬取的文章进行分词,计算文章hash值
+  * 通过fasttext对文章内容进行父分类，子分类
+  * 通过hash值得到相似文章及次数，并与类别合并成一个新表
+  * 从新表中提取数据供业务分析
   */
 object UrlFastTextLess {
   val business = "url"
@@ -20,8 +26,12 @@ object UrlFastTextLess {
   //生成不同的表，以实现效果对比
   val version = "v1"
   // 分词，计算hash
-  val keyTable = s"algo.dxp_${business}_${version}_fasttext_seg_hash"
-  val discardHashFile = "hdfs:///tmp/duanxiping/fasttext/shell/discard_hash.txt"
+  val keyTable = s"algo.dxp_${business}_${version}_fasttext_key"
+  val discardTable = s"algo.dxp_${business}_${version}_fasttext_discard"
+
+  val discardHashFile = "hdfs:///tmp/duanxiping/fasttext/data/discard_hash.txt"
+  val discardTitleFile = "hdfs:///tmp/duanxiping/fasttext/data/discard_title.txt"
+  val discardUrlFile = "hdfs:///tmp/duanxiping/fasttext/data/discard_url.txt"
 
   // fasttext分类
   val parentCatTable = s"algo.dxp_${business}_${version}_fasttext_pcat"
@@ -37,38 +47,104 @@ object UrlFastTextLess {
   /*
   分别进行分词，父分类，子分类
    */
+
+  /*
+  logger的使用
+  */
+  Logger.getLogger("org.apache.spark").setLevel(Level.INFO)
+  Logger.getLogger("dxp::").info("#" * 1000)
+  Logger.getLogger("dxp::").info("discard_hash:")
+
+
   def main(args: Array[String]): Unit = {
     val op: String = args(0)
     isDebug = args(1).toLowerCase == "true"
     val statDate = args(2)
+
     op match {
       case "key" => {
-        // 将sql数据导出与写入从函数中抽离.
         val sparkEnv = new SparkEnv("key").sparkEnv
-        val ori_sql = "select fid,fcontent " +
+
+        val ori_sql = "select fid,fcontent,furl,ftitle " +
           s"from uxip.dwd_browser_url_creeper where stat_date=${statDate}"
         val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
+        val sqlData = sparkEnv.sql(sql)
+        val partitions = sqlData.rdd.getNumPartitions
+        val repartData = if (partitions < 200) sqlData.repartition(200) else sqlData
 
-        val discardHashArr = sparkEnv.read.textFile(discardHashFile).rdd.map(_.toLong).collect()
+        val data: RDD[(Long, String, Long, String, String)] = keyExtract(repartData)
 
-
-        val data:RDD[(Long,String,Long)] = keyExtract(sparkEnv.sql(sql).repartition(200),discardHashArr)
-
-        val cols = Array("fid", "words","hash")
-        val colsType = Array("long", "string","long")
+        val cols = Array("fid", "words", "hash", "furl", "ftitle")
+        val colsType = Array("long", "string", "long", "string", "string")
         val st = DXPUtils.createSchema(cols.zip(colsType))
         val df: DataFrame = sparkEnv.createDataFrame(data.map(r => {
-          Row(r._1, r._2,r._3)
+          Row(r._1, r._2, r._3, r._4, r._5)
         }), st)
         DXPUtils.saveDataFrame(df, keyTable, statDate, sparkEnv)
+      }
+      case "discard" => {
+        val sparkEnv = new SparkEnv("discard").sparkEnv
+
+        // hash
+        val discardHashArr = sparkEnv.sparkContext.textFile(discardHashFile).filter(r => {
+          r != null && r.trim.length > 0
+        }).map(_.trim.toLong).collect()
+        discardHashArr.foreach(r => println(r))
+        val discardHashArrBr: Broadcast[Array[Long]] = sparkEnv.sparkContext.broadcast(discardHashArr)
+
+        // title
+        val discardTitleArr = sparkEnv.sparkContext.textFile(discardTitleFile).filter(r => {
+          r != null && r.trim.length > 0
+        }).map(_.trim).collect()
+        discardTitleArr.foreach(r => println(r))
+        val discardTitleArrBr: Broadcast[Array[String]] = sparkEnv.sparkContext.broadcast(discardTitleArr)
+
+        // url
+        val discardUrlArr = sparkEnv.sparkContext.textFile(discardUrlFile).filter(r => {
+          r != null && r.trim.length > 0
+        }).map(_.trim).collect()
+        discardUrlArr.foreach(r => println(r))
+        val discardUrlArrBr: Broadcast[Array[String]] = sparkEnv.sparkContext.broadcast(discardUrlArr)
+
+        val sql = s"select fid,words,hash,furl,ftitle from ${keyTable} where stat_date=${statDate}"
+        //这里选的是要丢掉的内容，要保留的内容逻辑取反就行.
+        val sqlData = sparkEnv.sql(sql).rdd.filter(r => {
+          val discard:Boolean = {
+            val hash = r.getAs[Long](2)
+            val furl: String = r.getAs[String](3)
+            var flag = false
+
+            (furl != null && furl.length > 0 && {
+              flag = false
+              for (url <- discardUrlArrBr.value if !flag) {
+                flag = furl.indexOf(url) != -1
+              }
+              flag
+            }) || hash == -1.toLong || {
+              flag = false
+              for (dHash <- discardHashArrBr.value if !flag) {
+                flag = FNVHash.distance(dHash, hash, 1)
+              }
+              flag
+            }
+          }
+          !discard
+        }).map(r => {
+          Row(r.getAs[Long](0), r.getAs[String](1), r.getAs[Long](2))
+        })
+        val cols = Array("fid", "words", "hash")
+        val colsType = Array("long", "string", "long")
+        val st = DXPUtils.createSchema(cols.zip(colsType))
+        val df: DataFrame = sparkEnv.createDataFrame(sqlData, st)
+        DXPUtils.saveDataFrame(df, discardTable, statDate, sparkEnv)
       }
       case "pcat" => {
         val cat = args(3)
         val sparkEnv = new SparkEnv(s"cat ${cat}").sparkEnv
-        val ori_sql = s"select fid,words from ${keyTable} where stat_date=${statDate} "
+        val ori_sql = s"select fid,words from ${discardTable} where stat_date=${statDate} "
         val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
 
-        val catData = classifyData(sparkEnv.sql(sql), cat)
+        val catData = ClassifyDataFrame.classifyData(sparkEnv.sql(sql), cat)
 
         val cols = Array("fid", "words", "cat", "prob")
         val colsType = Array("long", "string", "string", "double")
@@ -84,7 +160,7 @@ object UrlFastTextLess {
         val ori_sql = s"select fid,words from ${parentCatTable} where stat_date=${statDate} and cat='${cat}'"
         val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
 
-        val catData = classifyData(sparkEnv.sql(sql), cat)
+        val catData = ClassifyDataFrame.classifyData(sparkEnv.sql(sql), cat)
 
         val cols = Array("fid", "words", "cat", "prob")
         val colsType = Array("long", "string", "string", "double")
@@ -97,14 +173,14 @@ object UrlFastTextLess {
         DXPUtils.saveDataFrameWithTwoPartition(df, childCatTable, statDate, catPinYin, sparkEnv)
       }
       case "same" => findSame(statDate)
-      case "kbits"=>{
+      case "kbits" => {
         val kBits = args(3).toInt
         val bId = args(4).toInt
         findkBitsDistance(statDate, kBits, bId)
       }
       case "dup" => {
         val thres = args(3).toInt
-        saveDup(statDate,thres)
+        saveDup(statDate, thres)
       }
       case _ => {
         println(
@@ -119,14 +195,14 @@ object UrlFastTextLess {
   /*
   使用之前simhash已分好的词表, 因已只作一些筛选
    */
-  def keyExtract(df:DataFrame,discardHashArr:Array[Long]):RDD[(Long,String,Long)] = {
+  def keyExtract(df: DataFrame): RDD[(Long, String, Long, String, String)] = {
 
     df.rdd.filter(r => {
       val words = r.getAs[String](1)
       words != null && words.trim.length > 1
     }).map(r => {
       val words = Segment.segmentWithNature(r.getAs[String](1).replaceAll("[^\u4e00-\u9FCB]+", " ")).map(w => {
-        (w.word,w.nature.toString)
+        (w.word, w.nature.toString)
       }).filterNot(w => {
         val nt = w._2
         // 去掉以cdempqruwxyz开头的词性
@@ -134,51 +210,22 @@ object UrlFastTextLess {
       })
 
       // 去掉某些词性的词后，词序列长度至少大于5才进行hash运算.
-      val hashWords = words.filterNot(w=>"cdempqruwxyz".contains(w._2.substring(0,1)))
-      val hash:Option[Long] = if(hashWords.length < 5) None else Some(FNVHash.hashContent(words.
-        map(_._1)).longValue())
-
-      (r.getAs[Long](0), words.map(_._1).mkString(" "),hash)
-    }).filter(r=>{
-      !r._3.isEmpty && {
-        var flag: Boolean = false
-        for (dHash <- discardHashArr if !flag) {
-          flag = FNVHash.distance(r._3.get, dHash, 1)
-        }
-        !flag
+      val hashWords = words.filterNot(w => "cdempqruwxyz".contains(w._2.substring(0, 1)))
+      val hash: Long = FNVHash.hashContent(words.map(_._1)).longValue()
+      val furl: String = try {
+        if (r.getAs[String](2) == null) "" else r.getAs[String](2).split("/").take(3).mkString("/")
+      } catch {
+        case _ => ""
       }
-    }).map(r=>(r._1,r._2,r._3.get))
-  }
+      val ftitle: String = if (r.getAs[String](3) == null) "" else r.getAs[String](3)
 
-
-  /*
-  根据cat查询数据，结果存在分区表，分区有两个字段stat_date, cat
-   */
-  def classifyData(df:DataFrame, cat: String):RDD[(Long,String,String,Double)] = {
-
-    df.rdd.mapPartitions(e => {
-      val (key, parentModel) = loadSingleModel(cat)
-      e.map(r => {
-        val pcat = {
-          try {
-            parentModel.predictWithProb(r.getAs[String](1))
-          } catch {
-            case ex: Throwable => {
-              Log.info("error :" + ex.getMessage)
-              Log.info(s"** ${r.getAs[Long](0)}")
-              ("unknow", -1.0)
-            }
-          }
-        }
-        (r.getAs[Long](0), r.getAs[String](1), pcat._1, pcat._2)
-      })
+      (r.getAs[Long](0), words.map(_._1).mkString(" "), hash, furl, ftitle)
     })
-
   }
 
 
   // 找出重复量大于thres的数据,且找到fid对应的category, 以便业务核查
-  def saveDup(statDate:String, thres:Int) = {
+  def saveDup(statDate: String, thres: Int) = {
     val sparkEnv = new SparkEnv("kbits").sparkEnv
     //val inputTable = s"${distanceTable}_1_3"
     val outputTable = s"algo.dxp_simhash_threshold_${thres}"
@@ -191,29 +238,30 @@ object UrlFastTextLess {
       s" on b.fid = c.fid "
 
     // 采用udf函数对furl进行处理
-    val stripUrl = udf[String,String]{ w =>
-      try{
-        if(w == null) "" else w.split("/").take(3).mkString("/")
-      }catch{
+    val stripUrl = udf[String, String] { w =>
+      try {
+        if (w == null) "" else w.split("/").take(3).mkString("/")
+      } catch {
         case _ => ""
       }
     }
 
-    val replaceStr = udf[String,String]{w=>{
-      try{
-        if (w == null) "" else w.replaceAll("[\n\r\t ,]+","")
-      }catch{
+    val replaceStr = udf[String, String] { w => {
+      try {
+        if (w == null) "" else w.replaceAll("[\n\r\t ,]+", "")
+      } catch {
         case _ => ""
       }
 
-    }}
+    }
+    }
     val sql: String = if (isDebug) ori_sql + " limit 10000" else ori_sql
-    val data = sparkEnv.sql(sql).toDF("fid","hash","samelen","furl", "ftitle","fkeywords","fcontent","cat","prob")
+    val data = sparkEnv.sql(sql).toDF("fid", "hash", "samelen", "furl", "ftitle", "fkeywords", "fcontent", "cat", "prob")
     DXPUtils.saveDataFrame(data.
-      withColumn("furl",stripUrl(data("furl"))).
-      withColumn("ftitle",replaceStr(data("ftitle"))).
-      withColumn("fkeywords",replaceStr(data("fkeywords"))).
-      withColumn("fcontent",replaceStr(data("fcontent"))),dupTable,statDate,sparkEnv)
+      withColumn("furl", stripUrl(data("furl"))).
+      withColumn("ftitle", replaceStr(data("ftitle"))).
+      withColumn("fkeywords", replaceStr(data("fkeywords"))).
+      withColumn("fcontent", replaceStr(data("fcontent"))), dupTable, statDate, sparkEnv)
   }
 
 
@@ -222,7 +270,7 @@ object UrlFastTextLess {
     val sparkEnv = new SparkEnv("hash").sparkEnv
 
     val ori_sql = "select fid,hash " +
-      s"from ${keyTable} where stat_date=${statDate}"
+      s"from ${discardTable} where stat_date=${statDate}"
 
     val sql = if (isDebug) ori_sql + " limit 1000" else ori_sql
     val data = sparkEnv.sql(sql).rdd.map(r => {
@@ -263,12 +311,12 @@ object UrlFastTextLess {
 
     //处理输入表与输出表
     val kBitsTable = s"${distanceTable}_${kBits}"
-    val (inputTable,outputTable) = bId match {
-      case 0 => (sameTable,s"${kBitsTable}_0")
-      case 1|2|3 =>{
-        (s"${kBitsTable}_${bId-1}", s"${kBitsTable}_${bId}")
+    val (inputTable, outputTable) = bId match {
+      case 0 => (sameTable, s"${kBitsTable}_0")
+      case 1 | 2 | 3 => {
+        (s"${kBitsTable}_${bId - 1}", s"${kBitsTable}_${bId}")
       }
-      case _ =>{
+      case _ => {
         println("bad bId, exit...")
         sys.exit(1)
       }
@@ -280,7 +328,7 @@ object UrlFastTextLess {
 
     val sql: String = if (isDebug) ori_sql + " limit 10000" else ori_sql
     val data = sparkEnv.sql(sql).rdd.map(r => {
-      (moveByte(r.getAs[Long](1), bId), Array((r.getAs[Long](0), r.getAs[Long](1),r.getAs[Int](2))))
+      (moveByte(r.getAs[Long](1), bId), Array((r.getAs[Long](0), r.getAs[Long](1), r.getAs[Int](2))))
     }).reduceByKey(_ ++ _).flatMap(r => {
       val arrayBuffer = new ArrayBuffer[(Long, Long, String, Int)]()
       // 每次取前一次中重复次数最高的fid
@@ -304,13 +352,6 @@ object UrlFastTextLess {
       Row(r._1, r._2, r._3, r._4)
     }), st)
     DXPUtils.saveDataFrame(df, outputTable, statDate, sparkEnv)
-  }
-
-  def loadSingleModel(cat: String) = {
-    val catFile = s"${cat}.mode.ftz"
-    val tmpFile = SparkFiles.get(catFile)
-    val m = new FastTextClassifier(tmpFile, cat)
-    (cat, m)
   }
 
 }
